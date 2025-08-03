@@ -7,19 +7,6 @@ import yt_dlp
 from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
 
-# Handle youtubesearchpython import with fallback
-try:
-    from youtubesearchpython.__future__ import VideosSearch
-    YOUTUBE_SEARCH_AVAILABLE = True
-except Exception as e:
-    logger.warning(f"youtubesearchpython import error: {e}")
-    # Fallback to synchronous version
-    try:
-        from youtubesearchpython import VideosSearch as SyncVideosSearch
-        YOUTUBE_SEARCH_AVAILABLE = "sync"
-    except Exception:
-        YOUTUBE_SEARCH_AVAILABLE = False
-
 from alicex.utils.database import is_on_off
 from alicex.utils.formatters import time_to_seconds
 
@@ -82,64 +69,85 @@ class YouTubeAPI:
             link = link.split("?list=")[0]
         return link
 
-    async def safe_youtube_search(self, link: str, limit: int = 1):
-        """Safe YouTube search with fallback handling"""
-        try:
-            if YOUTUBE_SEARCH_AVAILABLE == True:
-                # Use async version
-                results = VideosSearch(link, limit=limit)
-                return await results.next()
-            elif YOUTUBE_SEARCH_AVAILABLE == "sync":
-                # Use sync version in executor
-                loop = asyncio.get_running_loop()
-                
-                def sync_search():
-                    results = SyncVideosSearch(link, limit=limit)
-                    return results.result()
-                
-                search_result = await loop.run_in_executor(None, sync_search)
-                return {"result": search_result["result"]}
-            else:
-                # Fallback to yt-dlp for basic info
-                return await self.fallback_video_info(link)
-        except Exception as e:
-            logger.error(f"YouTube search failed: {str(e)}")
-            return await self.fallback_video_info(link)
+    def is_youtube_url(self, text: str) -> bool:
+        """Check if text is a YouTube URL"""
+        youtube_patterns = [
+            r"(?:youtube\.com|youtu\.be)",
+            r"youtube\.com/watch\?v=",
+            r"youtu\.be/",
+            r"youtube\.com/embed/",
+            r"youtube\.com/v/",
+        ]
+        return any(re.search(pattern, text) for pattern in youtube_patterns)
 
-    async def fallback_video_info(self, link: str):
-        """Fallback method using yt-dlp when YouTube search fails"""
+    async def search_youtube_with_ytdlp(self, query: str, limit: int = 1):
+        """Search YouTube using yt-dlp instead of youtubesearchpython"""
         try:
-            ytdl_opts = {
-                **self.base_ytdl_opts,
-                "skip_download": True,
-            }
+            # If it's already a URL, use it directly
+            if self.is_youtube_url(query):
+                search_query = query
+            else:
+                # Use yt-dlp search functionality
+                search_query = f"ytsearch{limit}:{query}"
             
             loop = asyncio.get_running_loop()
             
-            def extract_info():
+            def extract_search_info():
+                ytdl_opts = {
+                    **self.base_ytdl_opts,
+                    "skip_download": True,
+                    "extract_flat": True if not self.is_youtube_url(query) else False,
+                }
+                
                 with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
-                    info = ydl.extract_info(link, download=False)
+                    info = ydl.extract_info(search_query, download=False)
                     return info
             
-            info = await loop.run_in_executor(None, extract_info)
+            info = await loop.run_in_executor(None, extract_search_info)
             
-            # Convert to youtubesearchpython format
-            duration = info.get("duration", 0)
-            duration_str = f"{duration//60}:{duration%60:02d}" if duration else "0:00"
+            if not info:
+                return {"result": []}
             
-            return {
-                "result": [{
-                    "title": info.get("title", "Unknown"),
-                    "id": info.get("id", ""),
-                    "duration": duration_str,
-                    "thumbnails": [{"url": info.get("thumbnail", "")}],
-                    "link": link,
-                    "channel": {"name": info.get("uploader", "Unknown")},
-                    "viewCount": {"text": str(info.get("view_count", 0))}
-                }]
-            }
+            # Handle search results vs direct URL
+            if "entries" in info and info["entries"]:
+                # Search results
+                results = []
+                for entry in info["entries"][:limit]:
+                    if not entry:
+                        continue
+                    
+                    duration = entry.get("duration", 0)
+                    duration_str = f"{duration//60}:{duration%60:02d}" if duration else "0:00"
+                    
+                    results.append({
+                        "title": entry.get("title", "Unknown"),
+                        "id": entry.get("id", ""),
+                        "duration": duration_str,
+                        "thumbnails": [{"url": entry.get("thumbnail", "")}] if entry.get("thumbnail") else [{"url": ""}],
+                        "link": f"https://www.youtube.com/watch?v={entry.get('id', '')}",
+                        "channel": {"name": entry.get("uploader", "Unknown")},
+                        "viewCount": {"text": str(entry.get("view_count", 0))}
+                    })
+                return {"result": results}
+            else:
+                # Direct URL result
+                duration = info.get("duration", 0)
+                duration_str = f"{duration//60}:{duration%60:02d}" if duration else "0:00"
+                
+                return {
+                    "result": [{
+                        "title": info.get("title", "Unknown"),
+                        "id": info.get("id", ""),
+                        "duration": duration_str,
+                        "thumbnails": [{"url": info.get("thumbnail", "")}],
+                        "link": query if self.is_youtube_url(query) else f"https://www.youtube.com/watch?v={info.get('id', '')}",
+                        "channel": {"name": info.get("uploader", "Unknown")},
+                        "viewCount": {"text": str(info.get("view_count", 0))}
+                    }]
+                }
+                
         except Exception as e:
-            logger.error(f"Fallback video info failed: {str(e)}")
+            logger.error(f"YouTube search with yt-dlp failed: {str(e)}")
             return {"result": []}
 
     async def exists(self, link: str, videoid: Union[bool, str] = None):
@@ -147,17 +155,7 @@ class YouTubeAPI:
         try:
             if videoid:
                 link = self.base + link
-            
-            # Enhanced regex patterns
-            youtube_patterns = [
-                r"(?:youtube\.com|youtu\.be)",
-                r"youtube\.com/watch\?v=",
-                r"youtu\.be/",
-                r"youtube\.com/embed/",
-                r"youtube\.com/v/",
-            ]
-            
-            return any(re.search(pattern, link) for pattern in youtube_patterns)
+            return self.is_youtube_url(link)
         except Exception as e:
             logger.error(f"URL validation error: {str(e)}")
             return False
@@ -197,13 +195,13 @@ class YouTubeAPI:
         return None
 
     async def details(self, link: str, videoid: Union[bool, str] = None):
-        """Enhanced video details with better error handling"""
+        """Enhanced video details using yt-dlp only"""
         try:
             if videoid:
                 link = self.base + link
             link = self.clean_url(link)
             
-            search_result = await self.safe_youtube_search(link, 1)
+            search_result = await self.search_youtube_with_ytdlp(link, 1)
             
             if not search_result.get("result"):
                 return "Unknown", "0:00", 0, "", ""
@@ -232,7 +230,7 @@ class YouTubeAPI:
                 link = self.base + link
             link = self.clean_url(link)
             
-            search_result = await self.safe_youtube_search(link, 1)
+            search_result = await self.search_youtube_with_ytdlp(link, 1)
             
             if search_result.get("result"):
                 return search_result["result"][0].get("title", "Unknown")
@@ -248,7 +246,7 @@ class YouTubeAPI:
                 link = self.base + link
             link = self.clean_url(link)
             
-            search_result = await self.safe_youtube_search(link, 1)
+            search_result = await self.search_youtube_with_ytdlp(link, 1)
             
             if search_result.get("result"):
                 return search_result["result"][0].get("duration", "0:00")
@@ -264,7 +262,7 @@ class YouTubeAPI:
                 link = self.base + link
             link = self.clean_url(link)
             
-            search_result = await self.safe_youtube_search(link, 1)
+            search_result = await self.search_youtube_with_ytdlp(link, 1)
             
             if search_result.get("result"):
                 return search_result["result"][0].get("thumbnails", [{}])[0].get("url", "").split("?")[0]
@@ -274,10 +272,17 @@ class YouTubeAPI:
             return ""
 
     async def video(self, link: str, videoid: Union[bool, str] = None):
-        """Cookie-free video stream URL extraction"""
+        """Cookie-free video stream URL extraction with search support"""
         try:
             if videoid:
                 link = self.base + link
+            
+            # If it's not a URL, search for it first
+            if not self.is_youtube_url(link):
+                search_result = await self.search_youtube_with_ytdlp(link, 1)
+                if search_result.get("result"):
+                    link = search_result["result"][0].get("link", link)
+            
             link = self.clean_url(link)
             
             proc = await asyncio.create_subprocess_exec(
@@ -328,11 +333,11 @@ class YouTubeAPI:
             return []
 
     async def track(self, link: str, videoid: Union[bool, str] = None):
-        """Enhanced track details with guaranteed return structure"""
+        """Enhanced track details with guaranteed return structure and search support"""
         # Default structure to prevent KeyError
         default_track = {
             "title": "Unknown",
-            "link": link,
+            "link": "",
             "vidid": "",
             "duration_min": "0:00",
             "thumb": "",
@@ -341,12 +346,12 @@ class YouTubeAPI:
         try:
             if videoid:
                 link = self.base + link
-            link = self.clean_url(link)
             
-            search_result = await self.safe_youtube_search(link, 1)
+            # Use yt-dlp search for everything now
+            search_result = await self.search_youtube_with_ytdlp(link, 1)
             
             if not search_result.get("result"):
-                logger.warning("No search results found for track")
+                logger.warning(f"No search results found for: {link}")
                 return default_track, ""
             
             result = search_result["result"][0]
@@ -354,7 +359,7 @@ class YouTubeAPI:
             title = result.get("title", "Unknown")
             duration_min = result.get("duration", "0:00")
             vidid = result.get("id", "")
-            yturl = result.get("link", link)
+            yturl = result.get("link", "")
             thumbnail = result.get("thumbnails", [{}])[0].get("url", "").split("?")[0]
             
             track_details = {
@@ -375,6 +380,13 @@ class YouTubeAPI:
         try:
             if videoid:
                 link = self.base + link
+            
+            # If not a URL, search first
+            if not self.is_youtube_url(link):
+                search_result = await self.search_youtube_with_ytdlp(link, 1)
+                if search_result.get("result"):
+                    link = search_result["result"][0].get("link", link)
+            
             link = self.clean_url(link)
             
             ytdl_opts = {**self.base_ytdl_opts}
@@ -420,9 +432,8 @@ class YouTubeAPI:
         try:
             if videoid:
                 link = self.base + link
-            link = self.clean_url(link)
             
-            search_result = await self.safe_youtube_search(link, 10)
+            search_result = await self.search_youtube_with_ytdlp(link, 10)
             result = search_result.get("result", [])
             
             if query_type < len(result):
@@ -449,12 +460,21 @@ class YouTubeAPI:
         format_id: Union[bool, str] = None,
         title: Union[bool, str] = None,
     ) -> str:
-        """Enhanced download function without cookies"""
+        """Enhanced download function without cookies and with search support"""
         try:
             if videoid:
                 link = self.base + link
-            link = self.clean_url(link)
             
+            # If not a URL, search first
+            if not self.is_youtube_url(link):
+                search_result = await self.search_youtube_with_ytdlp(link, 1)
+                if search_result.get("result"):
+                    link = search_result["result"][0].get("link", link)
+                else:
+                    logger.error("No search results found for download")
+                    return None
+            
+            link = self.clean_url(link)
             loop = asyncio.get_running_loop()
 
             def audio_dl():
@@ -465,7 +485,12 @@ class YouTubeAPI:
                 }
                 x = yt_dlp.YoutubeDL(ydl_optssx)
                 info = x.extract_info(link, False)
-                xyz = os.path.join("downloads", f"{info['id']}.{info['ext']}")
+                if not info:
+                    raise Exception("Failed to extract video info")
+                
+                file_ext = info.get('ext', 'mp3')  # Default to mp3 if ext not found
+                xyz = os.path.join("downloads", f"{info['id']}.{file_ext}")
+                
                 if os.path.exists(xyz):
                     return xyz
                 x.download([link])
@@ -480,7 +505,12 @@ class YouTubeAPI:
                 }
                 x = yt_dlp.YoutubeDL(ydl_optssx)
                 info = x.extract_info(link, False)
-                xyz = os.path.join("downloads", f"{info['id']}.{info['ext']}")
+                if not info:
+                    raise Exception("Failed to extract video info")
+                
+                file_ext = info.get('ext', 'mp4')  # Default to mp4 if ext not found
+                xyz = os.path.join("downloads", f"{info['id']}.{file_ext}")
+                
                 if os.path.exists(xyz):
                     return xyz
                 x.download([link])
