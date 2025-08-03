@@ -3,11 +3,41 @@ import os
 import re
 from typing import Union, Optional, Dict, List, Tuple
 import logging
-import yt_dlp
 import json
+from pathlib import Path
+
+# Multiple library imports with fallbacks
+try:
+    import yt_dlp
+    YTDLP_AVAILABLE = True
+except ImportError:
+    YTDLP_AVAILABLE = False
+    logging.warning("yt-dlp not available")
+
+try:
+    from pytube import YouTube, Search
+    PYTUBE_AVAILABLE = True
+except ImportError:
+    PYTUBE_AVAILABLE = False
+    logging.warning("pytube not available")
+
+try:
+    import youtube_dl
+    YOUTUBE_DL_AVAILABLE = True
+except ImportError:
+    YOUTUBE_DL_AVAILABLE = False
+    logging.warning("youtube-dl not available")
+
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    WEB_SCRAPING_AVAILABLE = True
+except ImportError:
+    WEB_SCRAPING_AVAILABLE = False
+    logging.warning("Web scraping dependencies not available")
+
 from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
-from pathlib import Path
 
 from alicex.utils.database import is_on_off
 from alicex.utils.formatters import time_to_seconds
@@ -17,7 +47,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 async def shell_cmd(cmd):
-    """Enhanced shell command execution with better error handling"""
+    """Enhanced shell command execution"""
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -30,9 +60,6 @@ async def shell_cmd(cmd):
             error_msg = errorz.decode("utf-8")
             if "unavailable videos are hidden" in error_msg.lower():
                 return out.decode("utf-8")
-            elif "video unavailable" in error_msg.lower():
-                logger.warning(f"Video unavailable: {error_msg}")
-                return ""
             else:
                 return error_msg
         return out.decode("utf-8")
@@ -41,7 +68,7 @@ async def shell_cmd(cmd):
         return f"Error: {str(e)}"
 
 
-class YouTubeAPI:
+class MultiLibraryYouTubeAPI:
     def __init__(self):
         self.base = "https://www.youtube.com/watch?v="
         self.regex = r"(?:youtube\.com|youtu\.be)"
@@ -53,60 +80,21 @@ class YouTubeAPI:
         self.downloads_dir = Path("downloads")
         self.downloads_dir.mkdir(exist_ok=True)
         
-        # Enhanced yt-dlp base options without cookies
-        self.base_ytdl_opts = {
-            "geo_bypass": True,
-            "nocheckcertificate": True,
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": False,
-            "socket_timeout": 30,
-            "retries": 3,
-            "fragment_retries": 3,
-            "ignoreerrors": True,
-            "no_color": True,
-            "default_search": "ytsearch",
-        }
-
-    def safe_duration_format(self, duration) -> str:
-        """Safely format duration handling None, float, int, and string values"""
-        try:
-            if duration is None:
-                return "0:00"
-            
-            if isinstance(duration, str):
-                if duration == "None" or duration == "":
-                    return "0:00"
-                # If it's already formatted, return as is
-                if ":" in duration:
-                    return duration
-                # Try to convert to number
-                try:
-                    duration = float(duration)
-                except:
-                    return "0:00"
-            
-            if isinstance(duration, (int, float)):
-                duration = int(duration)  # Convert to int to avoid float issues
-                if duration <= 0:
-                    return "0:00"
-                
-                hours = duration // 3600
-                minutes = (duration % 3600) // 60
-                seconds = duration % 60
-                
-                if hours > 0:
-                    return f"{hours}:{minutes:02d}:{seconds:02d}"
-                else:
-                    return f"{minutes}:{seconds:02d}"
-            
-            return "0:00"
-        except Exception as e:
-            logger.error(f"Duration formatting error: {str(e)}")
-            return "0:00"
+        # Library priority order (most reliable first)
+        self.library_priority = []
+        if PYTUBE_AVAILABLE:
+            self.library_priority.append("pytube")
+        if YTDLP_AVAILABLE:
+            self.library_priority.append("yt-dlp")
+        if YOUTUBE_DL_AVAILABLE:
+            self.library_priority.append("youtube-dl")
+        if WEB_SCRAPING_AVAILABLE:
+            self.library_priority.append("web-scraping")
+        
+        logger.info(f"Available libraries: {self.library_priority}")
 
     def clean_url(self, link: str) -> str:
-        """Clean YouTube URL by removing unnecessary parameters"""
+        """Clean YouTube URL"""
         if "&" in link:
             link = link.split("&")[0]
         if "?list=" in link:
@@ -126,28 +114,120 @@ class YouTubeAPI:
         ]
         return any(re.search(pattern, text.strip()) for pattern in youtube_patterns)
 
-    async def robust_youtube_search(self, query: str, limit: int = 1):
-        """Most robust YouTube search method"""
+    def safe_duration_format(self, duration) -> str:
+        """Safely format duration"""
         try:
-            if not query or query.strip() == "":
+            if duration is None:
+                return "0:00"
+            
+            if isinstance(duration, str):
+                if duration in ["None", ""]:
+                    return "0:00"
+                if ":" in duration:
+                    return duration
+                try:
+                    duration = float(duration)
+                except:
+                    return "0:00"
+            
+            if isinstance(duration, (int, float)):
+                duration = int(duration)
+                if duration <= 0:
+                    return "0:00"
+                
+                hours = duration // 3600
+                minutes = (duration % 3600) // 60
+                seconds = duration % 60
+                
+                if hours > 0:
+                    return f"{hours}:{minutes:02d}:{seconds:02d}"
+                else:
+                    return f"{minutes}:{seconds:02d}"
+            
+            return "0:00"
+        except Exception:
+            return "0:00"
+
+    def extract_video_id(self, url: str) -> str:
+        """Extract video ID from YouTube URL"""
+        patterns = [
+            r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
+            r'(?:embed\/)([0-9A-Za-z_-]{11})',
+            r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        return ""
+
+    async def search_with_pytube(self, query: str, limit: int = 1) -> Dict:
+        """Search using pytube library"""
+        try:
+            if not PYTUBE_AVAILABLE:
                 return {"result": []}
             
-            query = query.strip()
-            
-            # Method 1: Direct yt-dlp search (most reliable)
             loop = asyncio.get_running_loop()
             
-            def search_with_ytdlp():
+            def pytube_search():
                 try:
-                    # If it's a URL, extract info directly
+                    if self.is_youtube_url(query):
+                        # Direct URL
+                        yt = YouTube(query)
+                        return [{
+                            "title": yt.title,
+                            "id": yt.video_id,
+                            "duration": self.safe_duration_format(yt.length),
+                            "thumbnails": [{"url": yt.thumbnail_url}],
+                            "link": f"https://www.youtube.com/watch?v={yt.video_id}",
+                            "channel": {"name": yt.author},
+                            "viewCount": {"text": str(yt.views)}
+                        }]
+                    else:
+                        # Search query
+                        s = Search(query)
+                        results = []
+                        for video in s.results[:limit]:
+                            results.append({
+                                "title": video.title,
+                                "id": video.video_id,
+                                "duration": self.safe_duration_format(video.length),
+                                "thumbnails": [{"url": video.thumbnail_url}],
+                                "link": f"https://www.youtube.com/watch?v={video.video_id}",
+                                "channel": {"name": video.author},
+                                "viewCount": {"text": str(video.views)}
+                            })
+                        return results
+                except Exception as e:
+                    logger.error(f"Pytube search failed: {str(e)}")
+                    return []
+            
+            results = await loop.run_in_executor(None, pytube_search)
+            return {"result": results}
+            
+        except Exception as e:
+            logger.error(f"Pytube search error: {str(e)}")
+            return {"result": []}
+
+    async def search_with_ytdlp(self, query: str, limit: int = 1) -> Dict:
+        """Search using yt-dlp library"""
+        try:
+            if not YTDLP_AVAILABLE:
+                return {"result": []}
+            
+            loop = asyncio.get_running_loop()
+            
+            def ytdlp_search():
+                try:
                     if self.is_youtube_url(query):
                         search_query = query
                     else:
-                        # Use ytsearch for text queries
                         search_query = f"ytsearch{limit}:{query}"
                     
                     ytdl_opts = {
-                        **self.base_ytdl_opts,
+                        "quiet": True,
+                        "no_warnings": True,
                         "extract_flat": True,
                         "skip_download": True,
                     }
@@ -156,113 +236,142 @@ class YouTubeAPI:
                         search_info = ydl.extract_info(search_query, download=False)
                         
                         if not search_info:
-                            return None
-                        
-                        # Handle different response formats
-                        entries = []
-                        if "entries" in search_info and search_info["entries"]:
-                            entries = [entry for entry in search_info["entries"] if entry is not None]
-                        elif search_info.get("id"):
-                            # Single video result
-                            entries = [search_info]
-                        
-                        if not entries:
-                            return None
+                            return []
                         
                         results = []
+                        entries = search_info.get("entries", [search_info]) if "entries" in search_info else [search_info]
+                        
                         for entry in entries[:limit]:
-                            if not entry or not entry.get("id"):
-                                continue
-                            
-                            # Format duration safely
-                            duration_str = self.safe_duration_format(entry.get("duration"))
-                            
-                            result_entry = {
-                                "title": entry.get("title", "Unknown Title"),
-                                "id": entry.get("id", ""),
-                                "duration": duration_str,
-                                "thumbnails": [{"url": entry.get("thumbnail", "")}],
-                                "link": f"https://www.youtube.com/watch?v={entry.get('id', '')}",
-                                "channel": {"name": entry.get("uploader", "Unknown Channel")},
-                                "viewCount": {"text": str(entry.get("view_count", 0))}
-                            }
-                            results.append(result_entry)
-                        
-                        return {"result": results}
-                        
+                            if entry and entry.get("id"):
+                                results.append({
+                                    "title": entry.get("title", "Unknown"),
+                                    "id": entry.get("id", ""),
+                                    "duration": self.safe_duration_format(entry.get("duration")),
+                                    "thumbnails": [{"url": entry.get("thumbnail", "")}],
+                                    "link": f"https://www.youtube.com/watch?v={entry.get('id', '')}",
+                                    "channel": {"name": entry.get("uploader", "Unknown")},
+                                    "viewCount": {"text": str(entry.get("view_count", 0))}
+                                })
+                        return results
                 except Exception as e:
                     logger.error(f"yt-dlp search failed: {str(e)}")
-                    return None
+                    return []
             
-            # Execute search
-            result = await loop.run_in_executor(None, search_with_ytdlp)
-            
-            if result and result.get("result"):
-                return result
-            
-            # Method 2: Fallback with shell command
-            logger.info("Trying fallback search method...")
-            try:
-                if self.is_youtube_url(query):
-                    cmd = f'yt-dlp --dump-single-json --no-warnings --quiet "{query}"'
-                else:
-                    cmd = f'yt-dlp --dump-single-json --no-warnings --quiet "ytsearch1:{query}"'
-                
-                output = await shell_cmd(cmd)
-                
-                if output and not output.startswith("Error:"):
-                    try:
-                        info = json.loads(output)
-                        duration_str = self.safe_duration_format(info.get("duration"))
-                        
-                        return {
-                            "result": [{
-                                "title": info.get("title", "Unknown Title"),
-                                "id": info.get("id", ""),
-                                "duration": duration_str,
-                                "thumbnails": [{"url": info.get("thumbnail", "")}],
-                                "link": f"https://www.youtube.com/watch?v={info.get('id', '')}",
-                                "channel": {"name": info.get("uploader", "Unknown Channel")},
-                                "viewCount": {"text": str(info.get("view_count", 0))}
-                            }]
-                        }
-                    except json.JSONDecodeError:
-                        pass
-            except Exception as e:
-                logger.error(f"Fallback search failed: {str(e)}")
-            
-            # Method 3: Last resort - simple search
-            logger.info("Trying final fallback...")
-            if not self.is_youtube_url(query):
-                cmd = f'yt-dlp --get-title --get-id --get-duration --no-warnings --quiet "ytsearch1:{query}"'
-                output = await shell_cmd(cmd)
-                
-                if output and not output.startswith("Error:"):
-                    lines = [line.strip() for line in output.split("\n") if line.strip()]
-                    if len(lines) >= 2:
-                        title = lines[0] if len(lines) > 0 else "Unknown"
-                        video_id = lines[1] if len(lines) > 1 else ""
-                        duration = lines[2] if len(lines) > 2 else "0:00"
-                        
-                        return {
-                            "result": [{
-                                "title": title,
-                                "id": video_id,
-                                "duration": duration,
-                                "thumbnails": [{"url": f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"}],
-                                "link": f"https://www.youtube.com/watch?v={video_id}",
-                                "channel": {"name": "Unknown Channel"},
-                                "viewCount": {"text": "0"}
-                            }]
-                        }
-            
-            logger.error(f"All search methods failed for query: {query}")
-            return {"result": []}
+            results = await loop.run_in_executor(None, ytdlp_search)
+            return {"result": results}
             
         except Exception as e:
-            logger.error(f"Robust search completely failed: {str(e)}")
+            logger.error(f"yt-dlp search error: {str(e)}")
             return {"result": []}
 
+    async def search_with_youtube_dl(self, query: str, limit: int = 1) -> Dict:
+        """Search using youtube-dl library"""
+        try:
+            if not YOUTUBE_DL_AVAILABLE:
+                return {"result": []}
+            
+            loop = asyncio.get_running_loop()
+            
+            def youtubedl_search():
+                try:
+                    if self.is_youtube_url(query):
+                        search_query = query
+                    else:
+                        search_query = f"ytsearch{limit}:{query}"
+                    
+                    ydl_opts = {
+                        "quiet": True,
+                        "extract_flat": True,
+                    }
+                    
+                    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+                        search_info = ydl.extract_info(search_query, download=False)
+                        
+                        results = []
+                        entries = search_info.get("entries", [search_info]) if "entries" in search_info else [search_info]
+                        
+                        for entry in entries[:limit]:
+                            if entry and entry.get("id"):
+                                results.append({
+                                    "title": entry.get("title", "Unknown"),
+                                    "id": entry.get("id", ""),
+                                    "duration": self.safe_duration_format(entry.get("duration")),
+                                    "thumbnails": [{"url": entry.get("thumbnail", "")}],
+                                    "link": f"https://www.youtube.com/watch?v={entry.get('id', '')}",
+                                    "channel": {"name": entry.get("uploader", "Unknown")},
+                                    "viewCount": {"text": str(entry.get("view_count", 0))}
+                                })
+                        return results
+                except Exception as e:
+                    logger.error(f"youtube-dl search failed: {str(e)}")
+                    return []
+            
+            results = await loop.run_in_executor(None, youtubedl_search)
+            return {"result": results}
+            
+        except Exception as e:
+            logger.error(f"youtube-dl search error: {str(e)}")
+            return {"result": []}
+
+    async def search_with_web_scraping(self, query: str, limit: int = 1) -> Dict:
+        """Fallback web scraping method"""
+        try:
+            if not WEB_SCRAPING_AVAILABLE:
+                return {"result": []}
+            
+            # This is a basic implementation - you can enhance it
+            search_url = f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(search_url, headers=headers, timeout=10)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Extract video information from page
+            # This is a simplified implementation
+            results = []
+            # Implementation would parse the YouTube search results page
+            # For now, return empty to avoid complexity
+            
+            return {"result": results}
+            
+        except Exception as e:
+            logger.error(f"Web scraping failed: {str(e)}")
+            return {"result": []}
+
+    async def multi_library_search(self, query: str, limit: int = 1) -> Dict:
+        """Search using multiple libraries with fallback"""
+        for library in self.library_priority:
+            try:
+                logger.info(f"Trying search with {library}")
+                
+                if library == "pytube":
+                    result = await self.search_with_pytube(query, limit)
+                elif library == "yt-dlp":
+                    result = await self.search_with_ytdlp(query, limit)
+                elif library == "youtube-dl":
+                    result = await self.search_with_youtube_dl(query, limit)
+                elif library == "web-scraping":
+                    result = await self.search_with_web_scraping(query, limit)
+                else:
+                    continue
+                
+                if result and result.get("result"):
+                    logger.info(f"Search successful with {library}")
+                    return result
+                else:
+                    logger.warning(f"No results from {library}")
+                    
+            except Exception as e:
+                logger.error(f"Search failed with {library}: {str(e)}")
+                continue
+        
+        logger.error("All search methods failed")
+        return {"result": []}
+
+    # Keep all your existing method signatures for compatibility
     async def exists(self, link: str, videoid: Union[bool, str] = None):
         """Enhanced URL validation"""
         try:
@@ -274,13 +383,12 @@ class YouTubeAPI:
             return False
 
     async def url(self, message_1: Message) -> Union[str, None]:
-        """Enhanced URL extraction with better error handling"""
+        """Enhanced URL extraction"""
         messages = [message_1]
         if message_1.reply_to_message:
             messages.append(message_1.reply_to_message)
         
         for message in messages:
-            # Check text entities
             if message.entities:
                 for entity in message.entities:
                     if entity.type == MessageEntityType.URL:
@@ -293,7 +401,6 @@ class YouTubeAPI:
                         if await self.exists(entity.url):
                             return entity.url
             
-            # Check caption entities
             if message.caption_entities:
                 for entity in message.caption_entities:
                     if entity.type == MessageEntityType.TEXT_LINK:
@@ -308,12 +415,12 @@ class YouTubeAPI:
         return None
 
     async def details(self, link: str, videoid: Union[bool, str] = None):
-        """Enhanced video details using robust search"""
+        """Get video details using multi-library approach"""
         try:
             if videoid:
                 link = self.base + link
             
-            search_result = await self.robust_youtube_search(link, 1)
+            search_result = await self.multi_library_search(link, 1)
             
             if not search_result.get("result"):
                 return "Unknown", "0:00", 0, "", ""
@@ -327,7 +434,6 @@ class YouTubeAPI:
                 thumbnail = thumbnail.split("?")[0]
             vidid = result.get("id", "")
             
-            # Convert duration to seconds
             try:
                 if duration_min and duration_min != "0:00":
                     duration_sec = int(time_to_seconds(duration_min))
@@ -342,7 +448,7 @@ class YouTubeAPI:
             return "Unknown", "0:00", 0, "", ""
 
     async def title(self, link: str, videoid: Union[bool, str] = None):
-        """Enhanced title extraction"""
+        """Get video title"""
         try:
             details = await self.details(link, videoid)
             return details[0] if details else "Unknown"
@@ -351,7 +457,7 @@ class YouTubeAPI:
             return "Unknown"
 
     async def duration(self, link: str, videoid: Union[bool, str] = None):
-        """Enhanced duration extraction"""
+        """Get video duration"""
         try:
             details = await self.details(link, videoid)
             return details[1] if details else "0:00"
@@ -360,7 +466,7 @@ class YouTubeAPI:
             return "0:00"
 
     async def thumbnail(self, link: str, videoid: Union[bool, str] = None):
-        """Enhanced thumbnail extraction"""
+        """Get video thumbnail"""
         try:
             details = await self.details(link, videoid)
             return details[3] if details else ""
@@ -369,19 +475,40 @@ class YouTubeAPI:
             return ""
 
     async def video(self, link: str, videoid: Union[bool, str] = None):
-        """Cookie-free video stream URL extraction with search support"""
+        """Get video stream URL using multiple libraries"""
         try:
             if videoid:
                 link = self.base + link
             
             # Get proper URL if it's a search query
             if not self.is_youtube_url(link):
-                search_result = await self.robust_youtube_search(link, 1)
+                search_result = await self.multi_library_search(link, 1)
                 if search_result.get("result"):
                     link = search_result["result"][0].get("link", link)
                 else:
                     return 0, "No search results found"
             
+            # Try pytube first (often bypasses restrictions)
+            if PYTUBE_AVAILABLE:
+                try:
+                    loop = asyncio.get_running_loop()
+                    
+                    def get_stream_url():
+                        yt = YouTube(link)
+                        stream = yt.streams.filter(progressive=True, file_extension='mp4').first()
+                        if stream:
+                            return stream.url
+                        # Fallback to adaptive streams
+                        stream = yt.streams.get_highest_resolution()
+                        return stream.url if stream else None
+                    
+                    stream_url = await loop.run_in_executor(None, get_stream_url)
+                    if stream_url:
+                        return 1, stream_url
+                except Exception as e:
+                    logger.warning(f"Pytube stream extraction failed: {str(e)}")
+            
+            # Fallback to other methods
             link = self.clean_url(link)
             
             proc = await asyncio.create_subprocess_exec(
@@ -404,23 +531,40 @@ class YouTubeAPI:
                 error_msg = stderr.decode()
                 logger.error(f"Video stream extraction failed: {error_msg}")
                 return 0, error_msg
+                
         except Exception as e:
             logger.error(f"Error getting video stream: {str(e)}")
             return 0, str(e)
 
     async def playlist(self, link, limit, user_id, videoid: Union[bool, str] = None):
-        """Enhanced playlist extraction without cookies"""
+        """Get playlist using multiple methods"""
         try:
             if videoid:
                 link = self.listbase + link
             link = self.clean_url(link)
             
+            # Try pytube first
+            if PYTUBE_AVAILABLE:
+                try:
+                    from pytube import Playlist
+                    loop = asyncio.get_running_loop()
+                    
+                    def get_playlist():
+                        p = Playlist(link)
+                        return [url.split('v=')[1].split('&')[0] for url in p.video_urls[:limit]]
+                    
+                    result = await loop.run_in_executor(None, get_playlist)
+                    if result:
+                        return result
+                except Exception as e:
+                    logger.warning(f"Pytube playlist failed: {str(e)}")
+            
+            # Fallback to yt-dlp
             cmd = f"yt-dlp -i --get-id --flat-playlist --playlist-end {limit} --skip-download --no-warnings --quiet --socket-timeout 30 '{link}'"
             playlist = await shell_cmd(cmd)
             
             try:
                 result = playlist.split("\n")
-                # Filter out empty strings and invalid video IDs
                 result = [vid.strip() for vid in result if vid.strip() and len(vid.strip()) == 11]
             except Exception as e:
                 logger.error(f"Playlist parsing error: {str(e)}")
@@ -432,8 +576,7 @@ class YouTubeAPI:
             return []
 
     async def track(self, link: str, videoid: Union[bool, str] = None):
-        """Enhanced track details with guaranteed return structure"""
-        # Default structure to prevent KeyError
+        """Get track details with guaranteed structure"""
         default_track = {
             "title": "Unknown",
             "link": "",
@@ -446,7 +589,7 @@ class YouTubeAPI:
             if videoid:
                 link = self.base + link
             
-            search_result = await self.robust_youtube_search(link, 1)
+            search_result = await self.multi_library_search(link, 1)
             
             if not search_result.get("result"):
                 logger.warning(f"No search results found for track: {link}")
@@ -468,64 +611,96 @@ class YouTubeAPI:
             return default_track, ""
 
     async def formats(self, link: str, videoid: Union[bool, str] = None):
-        """Enhanced formats extraction without cookies"""
+        """Get available formats"""
         try:
             if videoid:
                 link = self.base + link
             
-            # Get proper URL if it's a search query
             if not self.is_youtube_url(link):
-                search_result = await self.robust_youtube_search(link, 1)
+                search_result = await self.multi_library_search(link, 1)
                 if search_result.get("result"):
                     link = search_result["result"][0].get("link", link)
             
             link = self.clean_url(link)
             
-            ytdl_opts = {**self.base_ytdl_opts}
-            ydl = yt_dlp.YoutubeDL(ytdl_opts)
-            
-            with ydl:
-                formats_available = []
+            # Try pytube first
+            if PYTUBE_AVAILABLE:
                 try:
-                    r = ydl.extract_info(link, download=False)
+                    loop = asyncio.get_running_loop()
                     
-                    for format in r.get("formats", []):
-                        try:
-                            format_str = str(format.get("format", ""))
-                        except:
-                            continue
-                            
-                        if not "dash" in format_str.lower():
+                    def get_formats():
+                        yt = YouTube(link)
+                        formats = []
+                        for stream in yt.streams:
+                            formats.append({
+                                "format": f"{stream.mime_type} {stream.resolution or stream.abr}",
+                                "filesize": stream.filesize or "Unknown",
+                                "format_id": stream.itag,
+                                "ext": stream.mime_type.split('/')[1] if stream.mime_type else "unknown",
+                                "format_note": stream.resolution or stream.abr or "",
+                                "resolution": stream.resolution or "audio only",
+                                "yturl": link,
+                            })
+                        return formats
+                    
+                    formats_available = await loop.run_in_executor(None, get_formats)
+                    return formats_available, link
+                except Exception as e:
+                    logger.warning(f"Pytube formats failed: {str(e)}")
+            
+            # Fallback to yt-dlp
+            if YTDLP_AVAILABLE:
+                ytdl_opts = {
+                    "quiet": True,
+                    "no_warnings": True,
+                }
+                
+                ydl = yt_dlp.YoutubeDL(ytdl_opts)
+                
+                with ydl:
+                    formats_available = []
+                    try:
+                        r = ydl.extract_info(link, download=False)
+                        
+                        for format in r.get("formats", []):
                             try:
-                                if all(key in format for key in ["format", "format_id", "ext"]):
-                                    formats_available.append({
-                                        "format": format.get("format"),
-                                        "filesize": format.get("filesize", "Unknown"),
-                                        "format_id": format.get("format_id"),
-                                        "ext": format.get("ext"),
-                                        "format_note": format.get("format_note", ""),
-                                        "resolution": format.get("resolution", "Unknown"),
-                                        "yturl": link,
-                                    })
+                                format_str = str(format.get("format", ""))
                             except:
                                 continue
                                 
-                except yt_dlp.DownloadError as e:
-                    logger.error(f"Format extraction failed: {str(e)}")
-                    return [], link
-                    
-            return formats_available, link
+                            if not "dash" in format_str.lower():
+                                try:
+                                    if all(key in format for key in ["format", "format_id", "ext"]):
+                                        formats_available.append({
+                                            "format": format.get("format"),
+                                            "filesize": format.get("filesize", "Unknown"),
+                                            "format_id": format.get("format_id"),
+                                            "ext": format.get("ext"),
+                                            "format_note": format.get("format_note", ""),
+                                            "resolution": format.get("resolution", "Unknown"),
+                                            "yturl": link,
+                                        })
+                                except:
+                                    continue
+                                    
+                    except Exception as e:
+                        logger.error(f"Format extraction failed: {str(e)}")
+                        return [], link
+                        
+                return formats_available, link
+            
+            return [], link
         except Exception as e:
             logger.error(f"Error getting formats: {str(e)}")
             return [], link
 
     async def slider(self, link: str, query_type: int, videoid: Union[bool, str] = None):
-        """Enhanced slider functionality"""
+        """Get similar videos"""
         try:
             if videoid:
                 link = self.base + link
             
-            search_result = await self.robust_youtube_search(link, 10)
+            search_result = await self.multi_library_search(link, 10)
             result = search_result.get("result", [])
             
             if query_type < len(result):
@@ -543,17 +718,13 @@ class YouTubeAPI:
             return "Unknown", "0:00", "", ""
 
     def safe_filename(self, filename: str) -> str:
-        """Create a safe filename by removing invalid characters"""
+        """Create safe filename"""
         if not filename:
             return "unknown"
         
-        # Remove invalid characters
         safe_name = re.sub(r'[<>:"/\\|?*]', '', filename)
-        # Replace spaces and other characters
         safe_name = re.sub(r'[\s\-]+', '_', safe_name)
-        # Limit length
         safe_name = safe_name[:100] if len(safe_name) > 100 else safe_name
-        # Ensure it's not empty
         safe_name = safe_name if safe_name else "unknown"
         
         return safe_name
@@ -568,15 +739,15 @@ class YouTubeAPI:
         songvideo: Union[bool, str] = None,
         format_id: Union[bool, str] = None,
         title: Union[bool, str] = None,
-    ) -> str:
-        """Enhanced download function with robust file handling"""
+    ):
+        """Enhanced download with multiple library support"""
         try:
             if videoid:
                 link = self.base + link
             
-            # Get proper URL and title if it's a search query
+            # Get proper URL and title
             if not self.is_youtube_url(link):
-                search_result = await self.robust_youtube_search(link, 1)
+                search_result = await self.multi_library_search(link, 1)
                 if search_result.get("result"):
                     video_info = search_result["result"][0]
                     link = video_info.get("link", link)
@@ -589,9 +760,35 @@ class YouTubeAPI:
             link = self.clean_url(link)
             loop = asyncio.get_running_loop()
 
+            # Try pytube first (often works without authentication)
+            if PYTUBE_AVAILABLE and not songaudio and not songvideo:
+                try:
+                    def pytube_download():
+                        yt = YouTube(link)
+                        
+                        if video:
+                            stream = yt.streams.filter(progressive=True, file_extension='mp4').first()
+                            if not stream:
+                                stream = yt.streams.get_highest_resolution()
+                        else:
+                            stream = yt.streams.filter(only_audio=True).first()
+                        
+                        if stream:
+                            filename = stream.download(output_path=str(self.downloads_dir))
+                            return filename
+                        return None
+                    
+                    downloaded_file = await loop.run_in_executor(None, pytube_download)
+                    if downloaded_file:
+                        return downloaded_file, True
+                except Exception as e:
+                    logger.warning(f"Pytube download failed: {str(e)}")
+
+            # Fallback to yt-dlp methods
             def audio_dl():
                 ydl_optssx = {
-                    **self.base_ytdl_opts,
+                    "quiet": True,
+                    "no_warnings": True,
                     "format": "bestaudio/best",
                     "outtmpl": str(self.downloads_dir / "%(id)s.%(ext)s"),
                 }
@@ -602,29 +799,26 @@ class YouTubeAPI:
                     raise Exception("Failed to extract video info")
                 
                 video_id = info.get('id', 'unknown')
-                file_ext = info.get('ext', 'webm')  # Default extension
+                file_ext = info.get('ext', 'webm')
                 
-                # Try common audio extensions
                 for ext in [file_ext, 'webm', 'mp4', 'm4a', 'opus']:
                     potential_file = self.downloads_dir / f"{video_id}.{ext}"
                     if potential_file.exists():
                         return str(potential_file)
                 
-                # Download if not exists
                 x.download([link])
                 
-                # Find the downloaded file
                 for ext in ['webm', 'mp4', 'm4a', 'opus']:
                     potential_file = self.downloads_dir / f"{video_id}.{ext}"
                     if potential_file.exists():
                         return str(potential_file)
                 
-                # Fallback
                 return str(self.downloads_dir / f"{video_id}.{file_ext}")
 
             def video_dl():
                 ydl_optssx = {
-                    **self.base_ytdl_opts,
+                    "quiet": True,
+                    "no_warnings": True,
                     "format": "(bestvideo[height<=?720][width<=?1280][ext=mp4])+(bestaudio[ext=m4a])/best[height<=?720]",
                     "outtmpl": str(self.downloads_dir / "%(id)s.%(ext)s"),
                     "merge_output_format": "mp4",
@@ -636,9 +830,8 @@ class YouTubeAPI:
                     raise Exception("Failed to extract video info")
                 
                 video_id = info.get('id', 'unknown')
-                file_ext = 'mp4'  # Force mp4 for videos
+                potential_file = self.downloads_dir / f"{video_id}.mp4"
                 
-                potential_file = self.downloads_dir / f"{video_id}.{file_ext}"
                 if potential_file.exists():
                     return str(potential_file)
                 
@@ -646,16 +839,13 @@ class YouTubeAPI:
                 return str(potential_file)
 
             def song_video_dl():
-                if not title:
-                    safe_title = "unknown"
-                else:
-                    safe_title = self.safe_filename(str(title))
-                
+                safe_title = self.safe_filename(str(title)) if title else "unknown"
                 formats = f"{format_id}+140" if format_id else "best"
                 fpath = str(self.downloads_dir / f"{safe_title}.%(ext)s")
                 
                 ydl_optssx = {
-                    **self.base_ytdl_opts,
+                    "quiet": True,
+                    "no_warnings": True,
                     "format": formats,
                     "outtmpl": fpath,
                     "prefer_ffmpeg": True,
@@ -667,15 +857,12 @@ class YouTubeAPI:
                 return str(self.downloads_dir / f"{safe_title}.mp4")
 
             def song_audio_dl():
-                if not title:
-                    safe_title = "unknown"
-                else:
-                    safe_title = self.safe_filename(str(title))
-                
+                safe_title = self.safe_filename(str(title)) if title else "unknown"
                 fpath = str(self.downloads_dir / f"{safe_title}.%(ext)s")
                 
                 ydl_optssx = {
-                    **self.base_ytdl_opts,
+                    "quiet": True,
+                    "no_warnings": True,
                     "format": format_id if format_id else "bestaudio/best",
                     "outtmpl": fpath,
                     "prefer_ffmpeg": True,
@@ -733,3 +920,8 @@ class YouTubeAPI:
         except Exception as e:
             logger.error(f"Download failed: {str(e)}")
             return None
+
+
+# For backward compatibility, use the original class name
+class YouTubeAPI(MultiLibraryYouTubeAPI):
+    pass
